@@ -18,6 +18,7 @@
 #include "stm32f1xx_hal.h"
 #include "main.h"      /* LED_R_GPIO_Port / LED_R_Pin */
 #include <stdio.h>     /* printf 重定向到 USART1（诊断，MicroLIB） */
+#include <time.h>      /* mktime/localtime_r（LSI 校准换算） */
 
 extern I2C_HandleTypeDef hi2c1;
 extern RTC_HandleTypeDef hrtc;
@@ -61,9 +62,50 @@ static void rtc_set_initial(void)
 static uint8_t bcd(uint8_t v) { return ((v / 10) << 4) | (v % 10); }
 static uint8_t bin(uint8_t b) { return (b & 0x0F) + ((b >> 4) & 0x0F) * 10; }
 
+/* ============ LSI 走时校准（2026-08-15） ============
+ * LSI（内部 40kHz RC）固有精度 ±1.5%~5%——本机实测偏快 1.67%（关机 1 小时
+ * 开机快 60 秒）。校准：RTC_CNT 计数差值 × 60/61 = 实际秒。
+ * 校准系数 = 标称秒数 / 实测计数（60 实际秒 → 61 计数）。
+ * 精确校准方法：time set → 关机精确 N 秒 → 开机对比 → 更新 RTC_CAL_DEN。 */
+#define RTC_CAL_NUM  60   /* 实际秒 */
+#define RTC_CAL_DEN  61   /* RTC 计数（LSI 偏快时计数 > 秒） */
+
+/* 校准基准：最近一次 SetTime 后的 (RTC_CNT, 时间) */
+static volatile uint32_t s_cal_base_cnt = 0;
+static volatile struct tm s_cal_base_tm;
+static volatile uint8_t s_cal_base_valid = 0;
+
+/* F103 RTC 秒计数器（CNTH:CNTL） */
+static uint32_t rtc_cnt_read(void)
+{
+    return ((uint32_t)(RTC->CNTH & 0xFFFF) << 16) | (RTC->CNTL & 0xFFFF);
+}
+
+/* 读取校准后的时间（替代 HAL_RTC_GetTime——HAL 不补偿 LSI 偏差） */
+static int rtc_get_calibrated(struct tm *t)
+{
+    if (!s_cal_base_valid) {
+        return -1;
+    }
+    struct tm base = (struct tm)s_cal_base_tm;   /* 本地拷贝（去 volatile） */
+    uint32_t diff = rtc_cnt_read() - s_cal_base_cnt;   /* LSI 计数差值 */
+    uint64_t sec = (uint64_t)diff * RTC_CAL_NUM / RTC_CAL_DEN;   /* 换算实际秒 */
+    time_t epoch = mktime(&base) + (time_t)sec;
+    localtime_r(&epoch, t);
+    return 0;
+}
+
+/* SetTime 应用后更新校准基准（poll 里调用） */
+static void rtc_set_base(const struct tm *t)
+{
+    s_cal_base_cnt = rtc_cnt_read();
+    s_cal_base_tm = *t;
+    s_cal_base_valid = 1;
+}
+
 /* ---------------- 读/写寄存器 ---------------- */
 
-/* 读时间类寄存器（0x00-0x06）：实时从 HAL RTC 映射 */
+/* 读时间类寄存器（0x00-0x06）：实时从校准后的 RTC 映射（LSI 偏差补偿） */
 static uint8_t reg_read(uint8_t reg)
 {
     if (reg == REG_CTRL) return s_ctrl;
@@ -71,8 +113,20 @@ static uint8_t reg_read(uint8_t reg)
     if (reg <= 0x06) {
         RTC_TimeTypeDef t;
         RTC_DateTypeDef d;
-        HAL_RTC_GetTime(&hrtc, &t, RTC_FORMAT_BIN);
-        HAL_RTC_GetDate(&hrtc, &d, RTC_FORMAT_BIN);
+        struct tm cal;
+        if (rtc_get_calibrated(&cal) == 0) {
+            /* 校准时间 → BCD */
+            t.Seconds = cal.tm_sec;
+            t.Minutes = cal.tm_min;
+            t.Hours = cal.tm_hour;
+            d.WeekDay = (cal.tm_wday == 0) ? 7 : cal.tm_wday;   /* tm_wday 0=Sun..6=Sat → HAL 1=Mon..7=Sun */
+            d.Date = cal.tm_mday;
+            d.Month = cal.tm_mon + 1;
+            d.Year = cal.tm_year - 100;   /* 2000 基准 */
+        } else {
+            HAL_RTC_GetTime(&hrtc, &t, RTC_FORMAT_BIN);
+            HAL_RTC_GetDate(&hrtc, &d, RTC_FORMAT_BIN);
+        }
         switch (reg) {
         case 0x00: return bcd(t.Seconds) | (s_paused ? 0x80 : 0x00);
         case 0x01: return bcd(t.Minutes);
@@ -149,6 +203,14 @@ void ds3231_sim_init(void)
     __HAL_RTC_SECOND_ENABLE_IT(&hrtc, RTC_IT_SEC);
     HAL_NVIC_SetPriority(RTC_IRQn, 0, 1);
     HAL_NVIC_EnableIRQ(RTC_IRQn);
+
+    /* 启动校准基准（MX_RTC_Init 的 2000-01-01；ESP32 time set 后更新） */
+    struct tm boot = {0};
+    boot.tm_year = 100;   /* 2000 */
+    boot.tm_mon = 0;
+    boot.tm_mday = 1;
+    boot.tm_isdst = -1;
+    rtc_set_base(&boot);
 }
 
 /* RTC 秒中断处理（stm32f1xx_it.c RTC_IRQHandler USER CODE 调用）：清标志 + 喂 IWDG */
@@ -306,6 +368,16 @@ void ds3231_sim_poll(void)
         HAL_RTC_SetDate(&hrtc, &d, RTC_FORMAT_BIN);
         HAL_RTC_SetTime(&hrtc, &t, RTC_FORMAT_BIN);
         s_paused = 0;
+        /* 更新校准基准（SetTime 后 RTC_CNT 重置，校准从新基准起算） */
+        struct tm cal = {0};
+        cal.tm_year = d.Year + 100;
+        cal.tm_mon = d.Month - 1;
+        cal.tm_mday = d.Date;
+        cal.tm_hour = t.Hours;
+        cal.tm_min = t.Minutes;
+        cal.tm_sec = t.Seconds;
+        cal.tm_isdst = -1;
+        rtc_set_base(&cal);
     }
 
     static uint32_t last_err = 0;
