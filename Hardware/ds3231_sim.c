@@ -375,8 +375,15 @@ void ds3231_sim_poll(void)
         d.WeekDay = (ds_wday == 1) ? 7 : (uint8_t)(ds_wday - 1);   /* DS3231 1=Sun → HAL 7=Sun */
         if (d.Month < 1 || d.Month > 12) d.Month = 1;
         if (d.Date < 1 || d.Date > 31) d.Date = 1;
+        /* F103 经典坑（2026-08-16 实测根因）：写 CNT（HAL 进入 CNF 初始化模式）期间
+         * 秒中断触发 → SECF 挂起且清不掉（RTOFF=0 时 CRL 写无效）→ RTOFF 永久卡 0
+         * → HAL_RTC_SetTime 超时、时间写不进（CNT 恒 0）。
+         * 修复：写前禁用秒中断 + 清 SECF，写后恢复。 */
+        __HAL_RTC_SECOND_DISABLE_IT(&hrtc, RTC_IT_SEC);
+        __HAL_RTC_SECOND_CLEAR_FLAG(&hrtc, RTC_FLAG_SEC);
         HAL_RTC_SetDate(&hrtc, &d, RTC_FORMAT_BIN);
         HAL_RTC_SetTime(&hrtc, &t, RTC_FORMAT_BIN);
+        __HAL_RTC_SECOND_ENABLE_IT(&hrtc, RTC_IT_SEC);
         s_paused = 0;
         /* 更新校准基准（SetTime 后 RTC_CNT 重置，校准从新基准起算） */
         struct tm cal = {0};
