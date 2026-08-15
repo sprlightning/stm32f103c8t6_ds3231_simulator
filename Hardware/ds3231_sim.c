@@ -71,18 +71,21 @@ static uint8_t bin(uint8_t b) { return (b & 0x0F) + ((b >> 4) & 0x0F) * 10; }
 #define RTC_CAL_NUM  60   /* 实际秒 */
 #define RTC_CAL_DEN  61   /* RTC 计数（LSI 偏快时计数 > 秒） */
 
-/* 校准基准：最近一次 SetTime 后的 (RTC_CNT, 时间) */
-static volatile uint32_t s_cal_base_cnt = 0;
+/* 校准基准：最近一次 SetTime 后的时间 */
 static volatile struct tm s_cal_base_tm;
 static volatile uint8_t s_cal_base_valid = 0;
 
-/* F103 RTC 秒计数器（CNTH:CNTL） */
-static uint32_t rtc_cnt_read(void)
+/* SetTime 应用后更新校准基准（poll 里调用） */
+static void rtc_set_base(const struct tm *t)
 {
-    return ((uint32_t)(RTC->CNTH & 0xFFFF) << 16) | (RTC->CNTL & 0xFFFF);
+    s_cal_base_tm = *t;
+    s_cal_base_valid = 1;
 }
 
-/* 读取校准后的时间（替代 HAL_RTC_GetTime——HAL 不补偿 LSI 偏差） */
+/* 读取校准后的时间（替代 HAL_RTC_GetTime——HAL 不补偿 LSI 偏差）
+ * 注意：F103 RTC 计数器 CNTH:CNTL 是 BCD 编码日历（不是线性秒计数），
+ * 直接做差值会在分钟/小时进位时跳变（10:00:59→10:01:00 的 diff=0x100-0x59=167）。
+ * 正确做法：用 HAL 解析当前时间（BCD 正确解码）→ epoch 线性秒差 → 乘校准系数 */
 static int rtc_get_calibrated(struct tm *t)
 {
     if (!s_cal_base_valid) {
@@ -90,19 +93,28 @@ static int rtc_get_calibrated(struct tm *t)
     }
     struct tm base;
     memcpy(&base, (const void *)&s_cal_base_tm, sizeof(base));   /* 本地拷贝（去 volatile；ARMCC V5 不支持 struct 强转） */
-    uint32_t diff = rtc_cnt_read() - s_cal_base_cnt;   /* LSI 计数差值 */
-    uint64_t sec = (uint64_t)diff * RTC_CAL_NUM / RTC_CAL_DEN;   /* 换算实际秒 */
-    time_t epoch = mktime(&base) + (time_t)sec;
-    localtime_r(&epoch, t);
+    RTC_TimeTypeDef rt;
+    RTC_DateTypeDef rd;
+    HAL_RTC_GetTime(&hrtc, &rt, RTC_FORMAT_BIN);
+    HAL_RTC_GetDate(&hrtc, &rd, RTC_FORMAT_BIN);
+    struct tm now = {0};
+    now.tm_year = rd.Year + 100;   /* HAL Year 0-99 → tm_year(1900 基准) */
+    now.tm_mon = rd.Month - 1;
+    now.tm_mday = rd.Date;
+    now.tm_hour = rt.Hours;
+    now.tm_min = rt.Minutes;
+    now.tm_sec = rt.Seconds;
+    now.tm_isdst = -1;
+    time_t base_epoch = mktime(&base);
+    time_t now_epoch = mktime(&now);
+    if (now_epoch < base_epoch) {
+        now_epoch = base_epoch;   /* RTC 被回拨（防倒退） */
+    }
+    /* HAL 标称秒差 × 系数 = 实际秒（LSI 偏快时 HAL 秒数 > 实际秒数） */
+    uint64_t diff = (uint64_t)(now_epoch - base_epoch);
+    time_t real_epoch = base_epoch + (time_t)(diff * RTC_CAL_NUM / RTC_CAL_DEN);
+    localtime_r(&real_epoch, t);
     return 0;
-}
-
-/* SetTime 应用后更新校准基准（poll 里调用） */
-static void rtc_set_base(const struct tm *t)
-{
-    s_cal_base_cnt = rtc_cnt_read();
-    s_cal_base_tm = *t;
-    s_cal_base_valid = 1;
 }
 
 /* ---------------- 读/写寄存器 ---------------- */
@@ -206,13 +218,9 @@ void ds3231_sim_init(void)
     HAL_NVIC_SetPriority(RTC_IRQn, 0, 1);
     HAL_NVIC_EnableIRQ(RTC_IRQn);
 
-    /* 启动校准基准（MX_RTC_Init 的 2000-01-01；ESP32 time set 后更新） */
-    struct tm boot = {0};
-    boot.tm_year = 100;   /* 2000 */
-    boot.tm_mon = 0;
-    boot.tm_mday = 1;
-    boot.tm_isdst = -1;
-    rtc_set_base(&boot);
+    /* 校准基准不在此建立：开机时 RTC 域可能保留上次时间（VBAT 有电）或已清零
+     * （CNT=0 → 2000-01-01），统一走 HAL 兜底；ESP32 time set 时由 poll 里的
+     * rtc_set_base 建立正确基准，校准从此起算 */
 }
 
 /* RTC 秒中断处理（stm32f1xx_it.c RTC_IRQHandler USER CODE 调用）：清标志 + 喂 IWDG */
