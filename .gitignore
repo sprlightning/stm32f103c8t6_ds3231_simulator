@@ -1,0 +1,4 @@
+# STM32 DS3231 模拟器（Keil 构建产物）
+MDK-ARM/stm32f103c8t6_ds3231_simulator/
+MDK-ARM/*.uvguix.*
+MDK-ARM/*.lst
