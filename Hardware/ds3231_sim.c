@@ -18,6 +18,7 @@
 #include "stm32f1xx_hal.h"
 #include "main.h"      /* LED_R_GPIO_Port / LED_R_Pin */
 #include <stdio.h>     /* printf 重定向到 USART1（诊断，MicroLIB） */
+#include <string.h>    /* memcpy（本地拷贝 volatile 结构体） */
 #include <time.h>      /* mktime/localtime_r（LSI 校准换算） */
 
 extern I2C_HandleTypeDef hi2c1;
@@ -87,7 +88,8 @@ static int rtc_get_calibrated(struct tm *t)
     if (!s_cal_base_valid) {
         return -1;
     }
-    struct tm base = (struct tm)s_cal_base_tm;   /* 本地拷贝（去 volatile） */
+    struct tm base;
+    memcpy(&base, (const void *)&s_cal_base_tm, sizeof(base));   /* 本地拷贝（去 volatile；ARMCC V5 不支持 struct 强转） */
     uint32_t diff = rtc_cnt_read() - s_cal_base_cnt;   /* LSI 计数差值 */
     uint64_t sec = (uint64_t)diff * RTC_CAL_NUM / RTC_CAL_DEN;   /* 换算实际秒 */
     time_t epoch = mktime(&base) + (time_t)sec;
