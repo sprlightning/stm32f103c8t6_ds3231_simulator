@@ -75,6 +75,9 @@ static uint8_t bin(uint8_t b) { return (b & 0x0F) + ((b >> 4) & 0x0F) * 10; }
 static volatile struct tm s_cal_base_tm;
 static volatile uint8_t s_cal_base_valid = 0;
 
+/* SECF 风暴自愈（2026-08-16）：中断里检测两次 SECF 间隔（正常 1s） */
+static volatile uint32_t s_last_secf_ms = 0;
+
 /* SetTime 应用后更新校准基准（poll 里调用） */
 static void rtc_set_base(const struct tm *t)
 {
@@ -223,11 +226,29 @@ void ds3231_sim_init(void)
      * rtc_set_base 建立正确基准，校准从此起算 */
 }
 
-/* RTC 秒中断处理（stm32f1xx_it.c RTC_IRQHandler USER CODE 调用）：清标志 + 喂 IWDG */
+/* RTC 秒中断处理（stm32f1xx_it.c RTC_IRQHandler USER CODE 调用）：清标志 + 喂 IWDG。
+ * SECF/风暴自愈（2026-08-16 实测）：PRL=0 时 RTC 分频=1 → SECF 40000Hz 中断风暴
+ * → 主循环饿死、写挂起（RTOFF=0）。中断里检测风暴（两次 SECF 间隔 <50ms）→
+ * BDRST 重置域 + 重配（RTCSEL/RTCEN/PRL）——必须在中断内完成（主循环已饿死）。 */
 void ds3231_sim_rtc_irq(void)
 {
     if (__HAL_RTC_SECOND_GET_IT_SOURCE(&hrtc, RTC_IT_SEC) &&
         __HAL_RTC_SECOND_GET_FLAG(&hrtc, RTC_FLAG_SEC)) {
+        uint32_t now = HAL_GetTick();
+        if (now - s_last_secf_ms < 50) {
+            /* 风暴（正常 1s 间隔）：PRL 丢失/分频错误——完整自愈。
+             * BDRST 重置域 → 重新配置 RTCSEL/RTCEN → HAL_RTC_Init 重跑
+             * （含等同步/写 PRL/验证——手动写 PRL 在时钟切换期会挂起） */
+            HAL_PWR_EnableBkUpAccess();
+            __HAL_RCC_BACKUPRESET_FORCE();
+            __HAL_RCC_BACKUPRESET_RELEASE();
+            RCC->BDCR = RCC_BDCR_RTCSEL_1 | RCC_BDCR_RTCEN;   /* RTCSEL=LSI + RTCEN */
+            hrtc.State = HAL_RTC_STATE_RESET;                  /* 触发 MspInit 重跑 */
+            HAL_RTC_Init(&hrtc);
+            __HAL_RTC_SECOND_ENABLE_IT(&hrtc, RTC_IT_SEC);
+            s_cal_base_valid = 0;   /* 校准基准失效（时间已重置） */
+        }
+        s_last_secf_ms = now;
         __HAL_RTC_SECOND_CLEAR_FLAG(&hrtc, RTC_FLAG_SEC);
         IWDG->KR = 0xAAAA;   /* 喂狗（IWDG 26s 超时，秒级喂狗充足） */
     }
