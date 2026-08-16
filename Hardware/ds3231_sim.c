@@ -75,6 +75,31 @@ static uint8_t bin(uint8_t b) { return (b & 0x0F) + ((b >> 4) & 0x0F) * 10; }
 static volatile struct tm s_cal_base_tm;
 static volatile uint8_t s_cal_base_valid = 0;
 
+/* 校准缓存（2026-08-16）：主循环 poll 每秒用 rtc_get_calibrated（mktime/
+ * localtime_r——非中断安全）计算，I2C 中断 reg_read 只读此纯 RAM 缓存。
+ * 之前中断里直接调 rtc_get_calibrated → 库函数卡死 → 从机读方向挂起。 */
+static volatile uint8_t s_cal_cache_sec, s_cal_cache_min, s_cal_cache_hour;
+static volatile uint8_t s_cal_cache_wday, s_cal_cache_mday, s_cal_cache_mon, s_cal_cache_year;
+static volatile uint8_t s_cal_cache_valid = 0;
+
+/* 主循环调用：校准并更新缓存（非中断上下文，库函数安全） */
+static void rtc_update_cal_cache(void)
+{
+    struct tm cal;
+    if (rtc_get_calibrated(&cal) != 0) {
+        s_cal_cache_valid = 0;
+        return;
+    }
+    s_cal_cache_sec = bcd(cal.tm_sec);
+    s_cal_cache_min = bcd(cal.tm_min);
+    s_cal_cache_hour = bcd(cal.tm_hour);
+    s_cal_cache_wday = (uint8_t)((cal.tm_wday == 0) ? 7 : cal.tm_wday);
+    s_cal_cache_mday = bcd(cal.tm_mday);
+    s_cal_cache_mon = bcd(cal.tm_mon + 1);
+    s_cal_cache_year = bcd(cal.tm_year - 100);
+    s_cal_cache_valid = 1;
+}
+
 /* SECF 风暴自愈（2026-08-16）：中断里检测两次 SECF 间隔（正常 1s） */
 static volatile uint32_t s_last_secf_ms = 0;
 
@@ -128,22 +153,26 @@ static uint8_t reg_read(uint8_t reg)
     if (reg == REG_CTRL) return s_ctrl;
     if (reg == REG_STAT) return s_stat;
     if (reg <= 0x06) {
+        /* 读方向（I2C EV 中断内）必须中断安全：校准计算（mktime/localtime_r）
+         * 是 C 库函数（非中断安全，2026-08-16 实测中断里调用卡死 → 从机读方向
+         * 挂起 → ESP32 读 DS3231 超时 → 回退 AXP 缓存 → 关机走时冻结）。
+         * 校准由主循环 poll 每秒计算写入 s_cal_cache，这里只读纯 RAM。 */
+        if (s_cal_cache_valid && s_cal_base_valid) {
+            switch (reg) {
+            case 0x00: return s_cal_cache_sec | (s_paused ? 0x80 : 0x00);
+            case 0x01: return s_cal_cache_min;
+            case 0x02: return s_cal_cache_hour;
+            case 0x03: return s_cal_cache_wday;
+            case 0x04: return s_cal_cache_mday;
+            case 0x05: return s_cal_cache_mon;
+            case 0x06: return s_cal_cache_year;
+            }
+        }
+        /* 无校准基准：HAL 直读（纯寄存器读，中断安全） */
         RTC_TimeTypeDef t;
         RTC_DateTypeDef d;
-        struct tm cal;
-        if (rtc_get_calibrated(&cal) == 0) {
-            /* 校准时间 → BCD */
-            t.Seconds = cal.tm_sec;
-            t.Minutes = cal.tm_min;
-            t.Hours = cal.tm_hour;
-            d.WeekDay = (cal.tm_wday == 0) ? 7 : cal.tm_wday;   /* tm_wday 0=Sun..6=Sat → HAL 1=Mon..7=Sun */
-            d.Date = cal.tm_mday;
-            d.Month = cal.tm_mon + 1;
-            d.Year = cal.tm_year - 100;   /* 2000 基准 */
-        } else {
-            HAL_RTC_GetTime(&hrtc, &t, RTC_FORMAT_BIN);
-            HAL_RTC_GetDate(&hrtc, &d, RTC_FORMAT_BIN);
-        }
+        HAL_RTC_GetTime(&hrtc, &t, RTC_FORMAT_BIN);
+        HAL_RTC_GetDate(&hrtc, &d, RTC_FORMAT_BIN);
         switch (reg) {
         case 0x00: return bcd(t.Seconds) | (s_paused ? 0x80 : 0x00);
         case 0x01: return bcd(t.Minutes);
@@ -416,6 +445,15 @@ void ds3231_sim_poll(void)
         cal.tm_sec = t.Seconds;
         cal.tm_isdst = -1;
         rtc_set_base(&cal);
+        rtc_update_cal_cache();   /* time set 后立即更新校准缓存 */
+    }
+
+    /* 周期校准缓存更新（1s 间隔）：I2C 中断 reg_read 只读缓存（中断安全） */
+    static uint32_t last_cal_ms = 0;
+    uint32_t now_ms = HAL_GetTick();
+    if (now_ms - last_cal_ms >= 1000) {
+        last_cal_ms = now_ms;
+        rtc_update_cal_cache();
     }
 
     static uint32_t last_err = 0;
