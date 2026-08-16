@@ -17,6 +17,7 @@
 #include "ds3231_sim.h"
 #include "stm32f1xx_hal.h"
 #include "main.h"      /* LED_R_GPIO_Port / LED_R_Pin */
+#include "rtc.h"       /* RTC_BKP_MAGIC（备份域持久化标记） */
 #include <stdio.h>     /* printf 重定向到 USART1（诊断，MicroLIB） */
 #include <string.h>    /* memcpy（本地拷贝 volatile 结构体） */
 #include <time.h>      /* mktime/localtime_r（LSI 校准换算） */
@@ -222,8 +223,14 @@ static void reg_write(uint8_t reg, uint8_t val)
 /* ---------------- I2C1 从机（寄存器级，覆盖 HAL 的主机配置） ---------------- */
 void ds3231_sim_init(void)
 {
-    /* 初始时间 + OSF=1 */
-    rtc_set_initial();
+    /* 初始时间 + OSF=1：仅首次上电（断电后 BKP 魔数丢失）执行；CPU 复位
+     * （魔数有效——MX_RTC_Init 已跳过 BDRST/SetTime 清零）保留域内走时，
+     * 模拟真 DS3231 独立芯片：复位不丢时间。 */
+    HAL_PWR_EnableBkUpAccess();
+    if (BKP->DR1 != RTC_BKP_MAGIC) {
+        rtc_set_initial();
+        BKP->DR1 = RTC_BKP_MAGIC;
+    }
 
     /* I2C1 从机配置：PCLK1=36MHz，地址 0x68，ACK 使能 */
     __HAL_RCC_I2C1_CLK_ENABLE();
@@ -275,6 +282,7 @@ void ds3231_sim_rtc_irq(void)
             hrtc.State = HAL_RTC_STATE_RESET;                  /* 触发 MspInit 重跑 */
             HAL_RTC_Init(&hrtc);
             __HAL_RTC_SECOND_ENABLE_IT(&hrtc, RTC_IT_SEC);
+            BKP->DR1 = RTC_BKP_MAGIC;   /* BDRST 清了 BKP：重新标记，下次复位保留走时 */
             s_cal_base_valid = 0;   /* 校准基准失效（时间已重置） */
         }
         s_last_secf_ms = now;

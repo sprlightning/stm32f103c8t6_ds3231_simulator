@@ -36,6 +36,11 @@ extern RTC_HandleTypeDef hrtc;
 
 /* USER CODE BEGIN Private defines */
 
+/* BKP_DR1 魔数：标记 RTC 备份域已初始化（时间有效）。真 DS3231 是独立芯片——
+ * CPU 复位（IWDG/调试器/复位键）不丢时间，只有断电才丢。MX_RTC_Init 与
+ * ds3231_sim_init 据此跳过 BDRST/SetTime 清零，使 CPU 复位保留走时。 */
+#define RTC_BKP_MAGIC   0xA5A5U
+
 /* USER CODE END Private defines */
 
 void MX_RTC_Init(void);
